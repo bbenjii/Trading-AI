@@ -44,7 +44,49 @@ class ArticleService:
             (article.content or "")[:2000],
         ]
         return "\n\n".join(p for p in parts if p)
-    
+
+    def get_articles_batch(
+            self,
+            limit: int = 1000,
+            last_id: ObjectId | None = None,
+            filter: Dict | None = None,
+            projection: Dict | None = None,
+            sort_dir: int = ASCENDING,
+    ) -> List[Article]:
+        """
+        Cursor-based pagination for large collections (faster than skip).
+        Fetches a batch ordered by _id.
+
+        Args:
+            limit: max docs to return
+            last_id: if provided, returns docs with _id > last_id (ASC) or _id < last_id (DESC)
+            filter: additional Mongo filters to apply
+            projection: Mongo projection; embedding is excluded by default
+            sort_dir: ASCENDING (default) for forward scan, DESCENDING for reverse scan
+
+        Returns:
+            List[Article]
+        """
+        filter = filter or {}
+
+        # Cursor condition
+        if last_id is not None:
+            if sort_dir == ASCENDING:
+                filter["_id"] = {"$gt": last_id}
+            else:
+                filter["_id"] = {"$lt": last_id}
+
+        projection = projection or {}
+        projection["embedding"] = False  # keep consistent with get_articles
+
+        cursor = (
+            self.collection.find(filter=filter, projection=projection)
+            .sort([("_id", sort_dir)])
+            .limit(limit)
+        )
+
+        docs = list(cursor)
+        return [Article(**doc) for doc in docs]
     def get_articles(
             self,
             filter: Dict | None = None,

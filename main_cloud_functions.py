@@ -1,9 +1,8 @@
 from pipelines import ArticlePipelineController
 from utils.logger import logger
 import os
-logger.setLevel("DEBUG")
-
-pipeline = ArticlePipelineController(article_limit=10, verify_db=True, asynchronous=True)
+ 
+pipeline = ArticlePipelineController(article_limit=1, verify_db=True, asynchronous=True)
 import nltk 
 import os
 

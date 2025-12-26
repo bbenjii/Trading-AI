@@ -174,10 +174,10 @@ class YahooStockMarket:
         symbol: str = "AVGO",
         days: int = 7,
         interval: str = "1d",
-        return_df: bool = False,
+        return_df: bool = True,
         start_time = None, end_time = None,
             prepost = False,
-    ) -> Optional[List[MarketCandle]|pd.DataFrame]:
+    ):
         
         ticker = yf.Ticker(symbol)
         if start_time and end_time:
@@ -201,7 +201,7 @@ class YahooStockMarket:
             return None
         
         if return_df:
-            return df
+            return {"df":df}
         
         return self._dataframe_to_candles(df)
 
@@ -301,7 +301,11 @@ def main() -> None:
     stock_market = YahooStockMarket()
 
     ticker = stock_market.get_stock_info(symbol=symbol)
-    daily_candles = stock_market.get_stock_history(symbol=symbol, days=5) or []
+    daily_candles = stock_market.get_stock_history(symbol=symbol, days=60) or []
+    
+    df = daily_candles.get("df")
+    list_of_dicts = df.to_dict(orient='index')
+
     intraday = stock_market.get_intraday_history(symbol=symbol, include_pre_post=True) or []
     most_active = stock_market.get_most_active_symbols(count=10)
 
@@ -313,5 +317,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     # continuous_fetch(delay_seconds=0.5)
-    # main()
-    print(YahooStockMarket().get_stock_info("$BRK"))
+    main()
+    # print(YahooStockMarket().get_stock_info("$BRK"))

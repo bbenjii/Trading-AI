@@ -1,33 +1,21 @@
 from google import genai
 from google.genai import types
 from google.genai.types import GenerateContentConfig, CreateBatchJobConfig, GoogleSearch
-from .system_instructions import *
-from services.scrapers import BaseScraper
+# from .system_instructions import *
+from services.scrapers import BaseScraper, YahooScraper
 from utils import logger
 import os
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from models import Article
+from models import Article, LlmSummary
 from utils.function_timer import function_timer
 
 load_dotenv()
 
 key = os.getenv("GEMINI_API_KEY")
-class LlmSummary(BaseModel):
-    """
-    Represents the expected JSON structure returned by the LLM summarization request.
-    """
-    summary: Optional[str] = None
-    tickers: Optional[List[str]] = None
-    sectors: Optional[List[str]] = None
-    keywords: Optional[List[str]] = None
-    sentiment: Optional[str] = Field(
-        default=None,
-        description="One of 'positive', 'negative', or 'neutral'."
-    )
 
 class GeminiService:
     """
@@ -99,11 +87,46 @@ class GeminiService:
         for article in articles:
             pass
 
-    def summarize_article(self, article: Article):
+    def to_article_fields(self, llm: LlmSummary) -> dict:
+        data = llm.model_dump()
+
+        # Convert ticker_sentiment_items -> dicts
+        items = data.pop("ticker_sentiment_items", None) or []
+        ticker_sentiments = {}
+        ticker_sentiment_reasoning = {}
+
+        for it in items:
+            t = (it.get("ticker") or "").upper().strip()
+            if not t:
+                continue
+            score = it.get("score")
+            if isinstance(score, (int, float)):
+                ticker_sentiments[t] = float(score)
+            r = it.get("reasoning")
+            if r:
+                ticker_sentiment_reasoning[t] = r
+
+        data["ticker_sentiments"] = ticker_sentiments or None
+        data["ticker_sentiment_reasoning"] = ticker_sentiment_reasoning or None
+
+        # Convert keyword_groups -> keyword_map
+        groups = data.pop("keyword_groups", None) or []
+        keyword_map = {}
+        for g in groups:
+            cat = (g.get("category") or "").strip()
+            items = g.get("items") or []
+            if cat:
+                keyword_map[cat] = items
+        data["keyword_map"] = keyword_map or None
+
+        return data
+    
+    def summarize_article(self, article: Article) -> Optional[Dict]:
         """
-        Sends a summarization request for a single Article and returns a one-sentence summary.
+        Sends a summarization/classification request for a single Article and returns a dict
+        matching the LlmSummary schema.
         """
-        # Build a compact article payload
+
         article_dict = article.model_dump()
         content = (article_dict.get("content") or "").strip()
 
@@ -113,47 +136,87 @@ class GeminiService:
             content = content[:max_chars]
 
         article_payload = {
-            "title": article_dict.get("title"),
+            "title": article_dict.get("title", ""),
             "content": content,
-            "publish_date": str(article_dict.get("publish_date", "")),
-            "url": article_dict.get("url"),
+            "publish_date": str(article_dict.get("publish_date") or ""),
+            "url": article_dict.get("url", ""),
+            "authors": article_dict.get("authors") or [],
+            "source": article_dict.get("source"),
         }
-        
+
         sys_instruct = (
-            "You are a precise financial news assistant. "
-            "You MUST respond with a valid JSON object that matches the provided schema "
-            "(summary, tickers, sectors, keywords, sentiment). "
-            "If a field is unknown, use null or an empty list as appropriate."
+            "You are a precise financial news assistant.\n"
+            "You MUST respond with a valid JSON object that matches the provided schema exactly.\n"
+            "If a field is unknown, use null or an empty list as appropriate.\n"
+            "Rules:\n"
+            "- All tickers must be uppercase (e.g., 'AAPL').\n"
+            "- sentiment must be exactly one of: positive, negative, neutral.\n"
+            "- sentiment_score must be between -1 and 1.\n"
+            "- importance_score must be between 0 and 1.\n"
+            "- Reasoning fields must be ONE concise sentence and must refer to facts stated in the article.\n"
+            "- If the corresponding field is null/empty, set its reasoning field to null.\n"
         )
 
         prompt_data = {
-            "task": "Summarize and tag the following financial news article.",
+            "task": "Extract structured fields for a financial news article.",
             "requirements": [
-                "Write ONE concise sentence summary in English that captures the main news event.",
-                "Return all clearly mentioned stock tickers as uppercase strings (e.g. 'AAPL'). "
-                "If none are mentioned, use an empty list.",
-                "Return broad sectors affected by the news, such as 'Technology', 'Financials', 'Energy', "
-                "'Materials', 'Consumer Discretionary', etc. Use an empty list if unclear.",
-                "Return 3 to 8 important keywords (company names, instruments, events, deals, etc.).",
-                "Set sentiment to 'positive', 'negative', or 'neutral' from the perspective of the main company/asset."
+                "summary_short: 1 concise sentence in English capturing the main event.",
+                "summary_bullets: 2 to 4 bullet points, each a single factual statement (no speculation).",
+                "summary_extended: 3 to 6 sentences, neutral and factual.",
+
+                "tickers: all clearly mentioned stock tickers as uppercase strings. If none, [].",
+                "primary_ticker: the main ticker the article is primarily about; null if none.",
+                "primary_ticker_reasoning: one sentence justification or null.",
+
+                "event_type: one of: earnings, guidance, merger_acquisition, partnership, lawsuit, regulation, "
+                "downgrade_upgrade, macro_data, insider_trading, dividend, stock_split, bankruptcy, product_launch, "
+                "investigation, geopolitical, analyst_commentary, other, null.",
+                "event_type_reasoning: one sentence justification or null.",
+
+                "sectors: broad sectors affected (e.g., Technology, Financials, Energy). If unclear, [].",
+                "sector_reasoning: one sentence justification or null.",
+                "industry: 0 to 3 more specific industries if clear (e.g., Semiconductors, Regional Banks). Else [].",
+                "industry_reasoning: one sentence justification or null.",
+
+                "keywords: 3 to 10 important keywords (companies, events, products, instruments).",
+                "keyword_map: group keywords into categories like companies, events, products, macro, financial_terms "
+                "when possible, else null.",
+                "keyword_reasoning: one sentence justification or null.",
+
+                "entities: 3 to 15 named entities (companies, people, regulators, countries) if present, else [].",
+
+                "sentiment: positive/negative/neutral from the perspective of the primary_ticker or main asset.",
+                "sentiment_score: numeric strength from -1 to 1.",
+                "sentiment_reasoning: one sentence justification or null.",
+                "ticker_sentiments: map each ticker to a -1..1 sentiment score when possible, else null.",
+                "ticker_sentiment_reasoning: map each ticker to one-sentence justification when possible, else null.",
+
+                "market_session: one of: premarket, market_hours, after_hours, weekend, unknown.",
+                "market_session_reasoning: one sentence justification or null.",
+
+                "source: source/publisher name if known from title/content, else null."
             ],
             "article": article_payload,
+            "output_format": "json"
         }
+
         payload = json.dumps(prompt_data, ensure_ascii=False, indent=2)
-        schema = LlmSummary
+
         try:
-            response: "LlmSummary" = self.send_request(prompt_data=payload, sys_instruct=sys_instruct, schema=schema)
-            
+            response: LlmSummary = self.send_request(
+                prompt_data=payload,
+                sys_instruct=sys_instruct,
+                schema=LlmSummary
+            )
         except Exception as e:
             logger.error(f"Error in summarizing article: {e}")
             return None
 
         if response is None:
             return None
-        
-        summary = response.model_dump()
 
-        return summary
+        # Return dict aligned with your Article fields
+        return self.to_article_fields(response)
 
     def send_text_request(self, message: str):
         """
@@ -198,10 +261,11 @@ class GeminiService:
         
         
 def main():
-    # yahoo_scraper = YahooScraper(limit=5, async_scrape=True)
+    yahoo_scraper = YahooScraper(limit=5, async_scrape=True)
     # print(yahoo_scraper.scrape())
-    # base_scraper = BaseScraper()
-    # articles = base_scraper.scrape(manual_fetch=True, urls=["https://www.benzinga.com/markets/tech/25/11/48886445/mark-zuckerberg-uses-an-unusual-hiring-rule-at-meta-and-it-starts-with-one-question-he-asks-himself-how-do-you-know-that-someone-is-good-enough"])
+    
+    base_scraper = BaseScraper()
+    articles = yahoo_scraper.scrape(manual_fetch=True, urls=["https://finance.yahoo.com/news/foreign-branded-phone-shipments-china-065049880.html"])
     # print(articles)
     # fetched_articles = [Article(url='https://finance.yahoo.com/news/protesters-oppose-trump-policies-no-163411318.html',
     #                             title='Protesters Oppose Trump Policies in ‘No Kings’ Events Across US',
@@ -216,15 +280,15 @@ def main():
     #                         summary='Andrew Bailey has claimed Brexit will hurt the economy for years to come.\nWhile Mr Bailey stressed that he was not offering a personal view of Brexit, he said that years of low UK productivity had driven up debt.\nIn a thinly-veiled jibe at Donald Trump, Mr Bailey also warned against erecting global trade barriers.\nMr Bailey added: “Longer term, you’ll get some adjustment.\nMr Bailey also suggested that policymakers were eyeing reforms that would make the gilt market less susceptible to financial stability risks.'),
     #                     ]
     
-    fetched_articles = [Article(url='https://www.benzinga.com/markets/tech/25/11/48886445/mark-zuckerberg-uses-an-unusual-hiring-rule-at-meta-and-it-starts-with-one-question-he-asks-himself-how-do-you-know-that-someone-is-good-enough', title="Mark Zuckerberg Uses An Unusual Hiring Rule At Meta — And It Starts With One Question He Asks Himself: 'How Do You Know That Someone Is Good Enough?' - Meta Platforms (NASDAQ:META)", content='Mark Zuckerberg once offered a rare look into how he decides who gets hired at Meta Platforms, Inc. (NASDAQ:META) — and it all hinges on a personal test that flips the traditional hiring process on its head. A Hiring Rule Built Around One Unusual Question During a 2022 conversation on the Lex Fridman Podcast, Zuckerberg said that when evaluating candidates, he turns to a simple but unexpected question: Would I work for this person in an alternate universe? Zuckerberg explained that he uses this as a gut-check on whether a candidate has the judgment, values and capability he wants on his team. "I will only hire someone to work for me if I could see myself working for them," he said, clarifying that it isn\'t about handing over the company but about whether the person is someone he could genuinely learn from. "There’s this question of, okay, how do you know that someone is good enough? And I think my answer is I would want someone to be on my team if I would work for them," he explained. See Also: Rory Sutherland Reveals The One Thought Pattern That Sets Jeff Bezos (And Elon Musk) Apart From Everyone Else In Business You Become Like the People You Surround Yourself With: Zuckerberg The Meta CEO said young people — especially those graduating from college — underestimate how much their inner circle shapes their future. He believes this rule applies just as much to choosing friends, mentors and colleagues as it does to hiring. People are too "objective-focused," he said, urging young adults to prioritize relationships over rigid goals. According to Zuckerberg, the right people challenge you, expand your thinking and push you toward who you want to become. Subscribe to the Benzinga Tech Trends newsletter to get all the latest tech developments delivered to your inbox. Bezos, Buffett, Musk And Jobs Say Hiring Talent Is Key To Long-Term Success Amazon.com founder Jeff Bezos has also long stressed hiring exceptional talent. In a 1998 interview, Bezos revealed that he devoted a third of job interviews to assessing whether candidates could themselves attract top performers — a skill he saw as crucial to Amazon\'s growth and execution. In a 1998 talk with MBA students at the University of Florida, Warren Buffett said he looks for integrity, intelligence and energy when hiring. He later noted during a 2021 shareholder meeting that ineffective management poses the greatest threat to a company, according to the Wall Street Journal. Tesla CEO Elon Musk has expressed views similar to Steve Jobs\', stressing that success depends on hiring exceptional talent and choosing strong managers. Jobs, too, often highlighted the value of selecting the right people, noting that the best managers are usually standout individual contributors who step up because they know the job must be done well. Benzinga’s Edge Stock Rankings show that META has been trending downward over the short, medium and long term. More performance insights can be found here. Check out more of Benzinga\'s Consumer Tech coverage by following this link. Read More: Tesla Investor Ross Gerber Says ‘Super Sad\' To See Federal EV Subsidies End: ‘Credits Created…\' Disclaimer: This content was partially produced with the help of AI tools and was reviewed and published by Benzinga editors. Photo Courtesy: Kemarrravv13 via Shutterstock.com', publish_date='2025-11-15 14:00:43-05:00', authors=['Ananya Gairola'], summary="Mark Zuckerberg once offered a rare look into how he decides who gets hired at Meta Platforms, Inc. (NASDAQ:META) — and it all hinges on a personal test that flips the traditional hiring process on its head.\nHe believes this rule applies just as much to choosing friends, mentors and colleagues as it does to hiring.\nAccording to Zuckerberg, the right people challenge you, expand your thinking and push you toward who you want to become.\nBezos, Buffett, Musk And Jobs Say Hiring Talent Is Key To Long-Term Success Amazon.com founder Jeff Bezos has also long stressed hiring exceptional talent.\nTesla CEO Elon Musk has expressed views similar to Steve Jobs', stressing that success depends on hiring exceptional talent and choosing strong managers.", keyword=None, sectors=None, keywords=None, sentiment=None, tickers=None)]
+    # fetched_articles = [Article(url='https://www.benzinga.com/markets/tech/25/11/48886445/mark-zuckerberg-uses-an-unusual-hiring-rule-at-meta-and-it-starts-with-one-question-he-asks-himself-how-do-you-know-that-someone-is-good-enough', title="Mark Zuckerberg Uses An Unusual Hiring Rule At Meta — And It Starts With One Question He Asks Himself: 'How Do You Know That Someone Is Good Enough?' - Meta Platforms (NASDAQ:META)", content='Mark Zuckerberg once offered a rare look into how he decides who gets hired at Meta Platforms, Inc. (NASDAQ:META) — and it all hinges on a personal test that flips the traditional hiring process on its head. A Hiring Rule Built Around One Unusual Question During a 2022 conversation on the Lex Fridman Podcast, Zuckerberg said that when evaluating candidates, he turns to a simple but unexpected question: Would I work for this person in an alternate universe? Zuckerberg explained that he uses this as a gut-check on whether a candidate has the judgment, values and capability he wants on his team. "I will only hire someone to work for me if I could see myself working for them," he said, clarifying that it isn\'t about handing over the company but about whether the person is someone he could genuinely learn from. "There’s this question of, okay, how do you know that someone is good enough? And I think my answer is I would want someone to be on my team if I would work for them," he explained. See Also: Rory Sutherland Reveals The One Thought Pattern That Sets Jeff Bezos (And Elon Musk) Apart From Everyone Else In Business You Become Like the People You Surround Yourself With: Zuckerberg The Meta CEO said young people — especially those graduating from college — underestimate how much their inner circle shapes their future. He believes this rule applies just as much to choosing friends, mentors and colleagues as it does to hiring. People are too "objective-focused," he said, urging young adults to prioritize relationships over rigid goals. According to Zuckerberg, the right people challenge you, expand your thinking and push you toward who you want to become. Subscribe to the Benzinga Tech Trends newsletter to get all the latest tech developments delivered to your inbox. Bezos, Buffett, Musk And Jobs Say Hiring Talent Is Key To Long-Term Success Amazon.com founder Jeff Bezos has also long stressed hiring exceptional talent. In a 1998 interview, Bezos revealed that he devoted a third of job interviews to assessing whether candidates could themselves attract top performers — a skill he saw as crucial to Amazon\'s growth and execution. In a 1998 talk with MBA students at the University of Florida, Warren Buffett said he looks for integrity, intelligence and energy when hiring. He later noted during a 2021 shareholder meeting that ineffective management poses the greatest threat to a company, according to the Wall Street Journal. Tesla CEO Elon Musk has expressed views similar to Steve Jobs\', stressing that success depends on hiring exceptional talent and choosing strong managers. Jobs, too, often highlighted the value of selecting the right people, noting that the best managers are usually standout individual contributors who step up because they know the job must be done well. Benzinga’s Edge Stock Rankings show that META has been trending downward over the short, medium and long term. More performance insights can be found here. Check out more of Benzinga\'s Consumer Tech coverage by following this link. Read More: Tesla Investor Ross Gerber Says ‘Super Sad\' To See Federal EV Subsidies End: ‘Credits Created…\' Disclaimer: This content was partially produced with the help of AI tools and was reviewed and published by Benzinga editors. Photo Courtesy: Kemarrravv13 via Shutterstock.com', publish_date='2025-11-15 14:00:43-05:00', authors=['Ananya Gairola'], summary="Mark Zuckerberg once offered a rare look into how he decides who gets hired at Meta Platforms, Inc. (NASDAQ:META) — and it all hinges on a personal test that flips the traditional hiring process on its head.\nHe believes this rule applies just as much to choosing friends, mentors and colleagues as it does to hiring.\nAccording to Zuckerberg, the right people challenge you, expand your thinking and push you toward who you want to become.\nBezos, Buffett, Musk And Jobs Say Hiring Talent Is Key To Long-Term Success Amazon.com founder Jeff Bezos has also long stressed hiring exceptional talent.\nTesla CEO Elon Musk has expressed views similar to Steve Jobs', stressing that success depends on hiring exceptional talent and choosing strong managers.", keyword=None, sectors=None, keywords=None, sentiment=None, tickers=None)]
     # article = fetched_articles[0]
     
     # print((fetched_articles))
     service = GeminiService(api_key=key)
     # # print(service.send_text_request("Hi what's up?"))
     # 
-    print(service.summarize_article(fetched_articles[0]))
-    summary = service.summarize_article(fetched_articles[0])
+    # print(service.summarize_article(articles[0]))
+    summary = service.summarize_article(articles[0])
     print(summary)
     
 if __name__ == "__main__":
