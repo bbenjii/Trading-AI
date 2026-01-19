@@ -18,3 +18,5 @@ flask
 google-cloud-error-reporting
 MarkupSafe
 certifi
+scikit-learn
+ta-lib
