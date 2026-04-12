@@ -261,11 +261,12 @@ class GeminiService:
         
         
 def main():
-    yahoo_scraper = YahooScraper(limit=5, async_scrape=True)
+    
+    # yahoo_scraper = YahooScraper(limit=5, async_scrape=True)
     # print(yahoo_scraper.scrape())
     
-    base_scraper = BaseScraper()
-    articles = yahoo_scraper.scrape(manual_fetch=True, urls=["https://finance.yahoo.com/news/foreign-branded-phone-shipments-china-065049880.html"])
+    # base_scraper = BaseScraper()
+    # articles = yahoo_scraper.scrape(manual_fetch=True, urls=["https://finance.yahoo.com/news/foreign-branded-phone-shipments-china-065049880.html"])
     # print(articles)
     # fetched_articles = [Article(url='https://finance.yahoo.com/news/protesters-oppose-trump-policies-no-163411318.html',
     #                             title='Protesters Oppose Trump Policies in ‘No Kings’ Events Across US',
@@ -285,11 +286,14 @@ def main():
     
     # print((fetched_articles))
     service = GeminiService(api_key=key)
-    # # print(service.send_text_request("Hi what's up?"))
+    # service.chat_session()
+    print(service.send_text_request("who is Goku"))
     # 
     # print(service.summarize_article(articles[0]))
-    summary = service.summarize_article(articles[0])
-    print(summary)
+    # summary = service.summarize_article(articles[0])
+    # print(summary)
+    
+    pass
     
 if __name__ == "__main__":
     load_dotenv()

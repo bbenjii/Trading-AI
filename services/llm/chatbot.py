@@ -521,4 +521,4 @@ tools = [get_stock_info, current_datetime,
          fetch_articles, 
          get_ticker_news, get_sector_news, search_articles_by_text, get_latest_articles, get_recent_articles]
 
-# gemini_client.chat_session(tools=tools, google_search=False)
+gemini_client.chat_session( google_search=False)
