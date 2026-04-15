@@ -25,7 +25,7 @@ from services.scrapers import (
 from utils import function_timer, logger, function_timer2
 from services.llm import gemini_client
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from services.database import article_service, pipeline_execution_service
+from services.database import article_service, pipeline_execution_service, catalyst_cluster_service
 logger.setLevel("DEBUG")
 
 class ArticlePipelineController:
@@ -34,6 +34,7 @@ class ArticlePipelineController:
         self.gemini_client = gemini_client
         self.article_db_service = article_service
         self.pipeline_db_service = pipeline_execution_service
+        self.catalyst_cluster_service = catalyst_cluster_service
         llm = self.gemini_client if llm_summary else None
 
         self.configs = {
@@ -206,10 +207,20 @@ class ArticlePipelineController:
         articles_fetched : list[Article] = self.fetch_latest_news_articles()
         logger.info(f"Total articles fetched: {len(articles_fetched)}")
         insert_result = {}
+        clustering_result = {}
         
         if articles_fetched:
             insert_result = self.article_db_service.insert_many_articles(articles_fetched, pipeline_run_id=pipeline_run_id)
             logger.info(f"Result: {insert_result}")
+
+            inserted_urls = list((insert_result.get("inserted_ids") or {}).keys())
+            if inserted_urls:
+                try:
+                    clustering_result = self.catalyst_cluster_service.cluster_articles_by_urls(inserted_urls)
+                    logger.info(f"Clustering result: {clustering_result}")
+                except Exception as e:
+                    clustering_result = {"status": "error", "error": str(e)}
+                    logger.exception("Catalyst clustering failed: %s", e)
         else:
             logger.info("No new articles fetched.")
 
@@ -234,6 +245,8 @@ class ArticlePipelineController:
                 } for s in self.active_scrapers],
             "articles_fetched": len(articles_fetched),
             "articles_inserted": insert_result.get("inserted_count", 0),
+            "articles_clustered": clustering_result.get("clustered", 0),
+            "clustering": clustering_result,
 
         }
         

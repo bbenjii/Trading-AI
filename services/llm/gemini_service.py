@@ -6,7 +6,7 @@ from services.scrapers import BaseScraper, YahooScraper
 from utils import logger
 import os
 import json
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -16,6 +16,24 @@ from utils.function_timer import function_timer
 load_dotenv()
 
 key = os.getenv("GEMINI_API_KEY")
+
+
+class ClusterLabelSummary(BaseModel):
+    canonical_title: Optional[str] = None
+    theme_label: Optional[str] = None
+    theme_reasoning: Optional[str] = None
+    catalyst_strength_label: Optional[Literal["high", "medium", "low"]] = None
+    impact_window: Optional[Literal["intraday", "1-3_days", "1-4_weeks", "unclear"]] = None
+    projected_direction: Optional[Literal["bullish", "bearish", "mixed", "unclear"]] = None
+    cluster_summary_short: Optional[str] = None
+    cluster_summary_bullets: Optional[List[str]] = None
+
+
+class ClusterMatchDecision(BaseModel):
+    decision: Literal["attach", "new", "skip"]
+    cluster_id: Optional[str] = None
+    confidence: float = Field(default=0.0)
+    reasoning: Optional[str] = None
 
 class GeminiService:
     """
@@ -218,6 +236,58 @@ class GeminiService:
         # Return dict aligned with your Article fields
         return self.to_article_fields(response)
 
+    def label_catalyst_cluster(self, cluster_payload: Dict) -> Optional[Dict]:
+        sys_instruct = (
+            "You are a precise financial news clustering assistant.\n"
+            "You normalize multiple related articles into one catalyst description.\n"
+            "Return valid JSON matching the schema exactly.\n"
+            "Be conservative and factual.\n"
+            "- canonical_title should be a concise story title, not a headline copy.\n"
+            "- theme_label should express the shared catalyst or theme.\n"
+            "- cluster_summary_short should be one sentence.\n"
+            "- cluster_summary_bullets should contain 2 to 4 factual bullets.\n"
+            "- catalyst_strength_label must be high, medium, or low.\n"
+            "- impact_window must be intraday, 1-3_days, 1-4_weeks, or unclear.\n"
+            "- projected_direction must be bullish, bearish, mixed, or unclear.\n"
+        )
+
+        response: ClusterLabelSummary | None = self.send_request(
+            prompt_data={
+                "task": "Create a canonical catalyst cluster label and summary for related financial news articles.",
+                "cluster_context": cluster_payload,
+            },
+            sys_instruct=sys_instruct,
+            schema=ClusterLabelSummary,
+        )
+        if response is None:
+            return None
+        return response.model_dump(exclude_none=True)
+
+    def decide_article_cluster(self, article_payload: Dict, candidate_clusters: List[Dict]) -> Optional[Dict]:
+        sys_instruct = (
+            "You are a precise financial news clustering assistant.\n"
+            "Decide whether a new article belongs to one existing catalyst cluster, should start a new cluster, or should be skipped.\n"
+            "A cluster represents the same underlying market-moving event, not merely similar wording.\n"
+            "Return valid JSON matching the schema exactly.\n"
+            "- decision must be attach, new, or skip.\n"
+            "- cluster_id must be present only when decision is attach.\n"
+            "- confidence must be between 0 and 1.\n"
+            "- reasoning must be one concise sentence.\n"
+        )
+
+        response: ClusterMatchDecision | None = self.send_request(
+            prompt_data={
+                "task": "Decide the best catalyst cluster assignment for a new article.",
+                "article": article_payload,
+                "candidate_clusters": candidate_clusters,
+            },
+            sys_instruct=sys_instruct,
+            schema=ClusterMatchDecision,
+        )
+        if response is None:
+            return None
+        return response.model_dump(exclude_none=True)
+
     def send_text_request(self, message: str):
         """
         Sends a simple text message to the Gemini API and returns the response.
@@ -304,4 +374,3 @@ if __name__ == "__main__":
     # client = GeminiService(api_key=key)
     # client.chat_session()
     # 
-
