@@ -26,14 +26,14 @@ def get_tickers(
         symbol_filter=None,
         decay_coefficient: float = 0.02,
         importance_weight: float = 0.5,
+        sentiment_weight: float = 0.4,
+        symbol_score_weight: float = 0.6,
 ):
     if now is None:
         now = datetime.now(timezone.utc)
     now = _to_utc(now)
 
     start = now - timedelta(hours=hours_back)
-    start_str = start.strftime("%Y-%m-%d 00:00:00")
-    now_str = now.strftime("%Y-%m-%d 23:59:59")
 
     filter_stage = {
         '$match': {
@@ -192,16 +192,21 @@ def get_tickers(
             "neutral_sentiment": r.get("neutral_percent"),
             "weighted_sentiment_score": (r.get("positive_percent") - r.get("negative_percent")) * math.log(1 + r.get("count")),
             "symbol_score": r.get("symbol_score") * math.log(1 + r.get("count")),
-            "return": r.get("return")
+            # This is momentum observed up to `now`, not a post-decision label.
+            "recent_return_pct": r.get("return")
         }
         for r in tickers
     ])
 
-    # df["score"] = df["weighted_sentiment_score"] * math.log(1+ df["return"])
-    df["score"] = df["weighted_sentiment_score"] * df["return"]
-    df["score2"] = df["symbol_score"] * df["return"]
+    if df.empty:
+        return df
 
-    df = df.sort_values(by=["score", "return"], ascending=False)
+    df["signal_score"] = (
+        sentiment_weight * df["weighted_sentiment_score"] +
+        symbol_score_weight * df["symbol_score"]
+    )
+
+    df = df.sort_values(by=["signal_score", "symbol_score", "recent_return_pct"], ascending=False)
 
     return df
 

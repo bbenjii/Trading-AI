@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import json
+from pathlib import Path
 
 import time
 from datetime import datetime, timezone, timedelta
@@ -26,6 +29,14 @@ def timestamp_to_datetime(value: Optional[float]) -> Optional[str]:
     else:
         return None
     return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _cacheable_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
 
 
 class Ticker(BaseModel):
@@ -56,6 +67,14 @@ class YahooStockMarket:
 
     def __init__(self, *, auto_adjust: bool = False) -> None:
         self.auto_adjust = auto_adjust
+        self._history_cache: Dict[tuple, Optional[pd.DataFrame]] = {}
+        self._history_cache_dir = Path.cwd() / ".cache" / "marketdata" / "history"
+        self._history_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _history_cache_path(self, cache_key: tuple) -> Path:
+        payload = json.dumps(cache_key, sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self._history_cache_dir / f"{digest}.pkl"
 
     def _dataframe_to_candles(self, df: pd.DataFrame) -> List[MarketCandle]:
         if df.empty:
@@ -101,6 +120,23 @@ class YahooStockMarket:
             fiftyTwoWeekHigh=info.get("fiftyTwoWeekHigh") or fast_info.get("year_high"),
             fiftyTwoWeekLow=info.get("fiftyTwoWeekLow") or fast_info.get("year_low"),
         )
+
+    def get_symbol_metadata(self, symbol: str) -> Dict[str, Optional[object]]:
+        ticker = yf.Ticker(symbol)
+        try:
+            info: Dict = ticker.get_info()
+        except Exception as exc:  # pragma: no cover - remote errors
+            logger.error("Unable to fetch %s metadata via yfinance: %s", symbol, exc)
+            return {}
+
+        return {
+            "symbol": symbol.upper(),
+            "shortName": info.get("shortName"),
+            "longName": info.get("longName"),
+            "quoteType": info.get("quoteType"),
+            "exchange": info.get("exchange"),
+            "currency": info.get("currency"),
+        }
     PeriodInterval = Literal["1m", "1h", "1d", "1w", "1mo"]
     
     def get_multiple_stock_df(
@@ -178,14 +214,41 @@ class YahooStockMarket:
         start_time = None, end_time = None,
             prepost = False,
     ):
-        
-        ticker = yf.Ticker(symbol)
+        symbol = symbol.upper()
         if start_time and end_time:
             end = end_time
             start = start_time
         else:
             end = datetime.now(timezone.utc)
             start = end - timedelta(days=days)
+
+        cache_key = (
+            symbol,
+            days,
+            interval,
+            _cacheable_datetime(start),
+            _cacheable_datetime(end),
+            prepost,
+            self.auto_adjust,
+        )
+        cached_df = self._history_cache.get(cache_key)
+        if cached_df is not None:
+            if return_df:
+                return {"df": cached_df.copy()}
+            return self._dataframe_to_candles(cached_df)
+
+        cache_path = self._history_cache_path(cache_key)
+        if cache_path.exists():
+            try:
+                disk_df = pd.read_pickle(cache_path)
+                self._history_cache[cache_key] = disk_df.copy()
+                if return_df:
+                    return {"df": disk_df.copy()}
+                return self._dataframe_to_candles(disk_df)
+            except Exception as exc:
+                logger.warning("Unable to read cached history for %s: %s", symbol, exc)
+
+        ticker = yf.Ticker(symbol)
 
         try:
             df = ticker.history(
@@ -199,9 +262,15 @@ class YahooStockMarket:
         except Exception as exc:  # pragma: no cover - remote errors
             logger.error("Unable to fetch %s history via yfinance: %s", symbol, exc)
             return None
+
+        self._history_cache[cache_key] = df.copy()
+        try:
+            df.to_pickle(cache_path)
+        except Exception as exc:
+            logger.warning("Unable to write cached history for %s: %s", symbol, exc)
         
         if return_df:
-            return {"df":df}
+            return {"df": df.copy()}
         
         return self._dataframe_to_candles(df)
 
