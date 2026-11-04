@@ -1,12 +1,13 @@
 import newspaper
 from bs4 import BeautifulSoup
 from typing import List, Optional
+from urllib.parse import urljoin, urlparse
 from services.scrapers.base_news_scraper import BaseScraper, Article
 from utils.function_timer import function_timer
 from utils.logger import logger
     
 class YahooScraper(BaseScraper):
-    BASE_URL = "https://finance.yahoo.com/topic/latest-news/"
+    BASE_URL = "https://finance.yahoo.com/news/"
     # HEADERS = {"User-Agent": "Mozilla/5.0"}
 
     def __init__(self, **kwargs):
@@ -30,15 +31,23 @@ class YahooScraper(BaseScraper):
         # Fallback in case Yahoo changes layout
         if not candidates:
             candidates = soup.select("ul[class*='stream-items'] li a.subtle-link[href*='/news/']")
+
+        if not candidates:
+            candidates = soup.select("a.titles[href*='/articles/'], a.titles[href*='/news/']")
         
+        candidates.extend(soup.select("a[href*='/news/'], a[href*='/articles/']"))
         links, seen = [], set()
         
         for a in candidates:
             href = a.get("href")
             if not href:
                 continue
-            if href.startswith("/"):
-                href = f"https://finance.yahoo.com{href}"
+            href = urljoin("https://finance.yahoo.com", href)
+            parts = urlparse(href)
+            if (parts.scheme != "https" or parts.hostname != "finance.yahoo.com"
+                    or not (parts.path.startswith("/news/") or "/articles/" in parts.path)
+                    or not parts.path.endswith(".html")):
+                continue
 
             url = self.normalize_url(href)
 
@@ -49,8 +58,6 @@ class YahooScraper(BaseScraper):
             seen.add(url)
             links.append(url)
 
-            if len(links) >= self.limit:
-                break
         
         return links
         
@@ -63,7 +70,6 @@ class YahooScraper(BaseScraper):
             return None
 
         news_article = newspaper.article(url=url, input_html=html)
-        news_article.nlp()
         publish_date = news_article.publish_date
         authors = news_article.authors
         title = news_article.title
@@ -74,7 +80,8 @@ class YahooScraper(BaseScraper):
         if not paragraphs:
             paragraphs = soup.select("div[data-test-locator='article-body'] p")
 
-        content = " ".join(p.get_text(strip=True) for p in paragraphs)
+        content = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+        content = content or (news_article.text or "").strip()
 
         article = Article(
             url=self.normalize_url(url),
@@ -86,7 +93,7 @@ class YahooScraper(BaseScraper):
         )
 
         try:
-            update = self.gemini_client.summarize_article(article)
+            update = self.gemini_client.summarize_article(article) if self.gemini_client else None
             if update:
                 article = article.model_copy(update=update)
         except Exception as e:
@@ -112,4 +119,3 @@ def async_fetch_yahoo_articles():
 if __name__ == "__main__":
     # fetch_yahoo_articles()
     async_fetch_yahoo_articles()
-    

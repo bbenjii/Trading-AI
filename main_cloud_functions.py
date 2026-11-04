@@ -12,12 +12,18 @@ def run_article_fetch_pipeline(request):
     """
     logger.info("Cloud Function triggered to run article pipeline.")
     try:
-        pipeline.run()
-        logger.info("Article pipeline run completed.")
-        return "ok", 200
+        result = pipeline.run()
+        logger.info("Article pipeline completed: status=%s inserted=%s",
+                    result["status"], result["articles_inserted"])
+        return {
+            "status": result["status"],
+            "articles_fetched": result["articles_fetched"],
+            "articles_inserted": result["articles_inserted"],
+            "failed_sources": result["failed_sources"],
+        }, 503 if result["status"] == "failed" else 200
     except Exception as e:
-        logger.error("Error occurred during article pipeline run: %s", e)
-        return f"error: {e}", 500
+        logger.error("Article pipeline execution failed: %s", type(e).__name__)
+        return {"status": "failed", "error": "Pipeline execution failed"}, 500
 
 if __name__ == "__main__":
     

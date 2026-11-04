@@ -5,14 +5,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from pymongo import MongoClient, UpdateOne, DESCENDING, ASCENDING
 from models import Article
 from services.llm import gemini_client
 from utils import function_timer
+from services.article_enrichment import STATUS_FIELDS
 
 class ArticleService:
+    ENRICHMENT_FIELDS = {
+        "summary_short",
+        "summary_bullets",
+        "summary_extended",
+        "event_type",
+        "event_type_reasoning",
+        "importance_score",
+        "importance_reasoning",
+        "sentiment",
+        "sentiment_score",
+        "sentiment_reasoning",
+        "ticker_sentiments",
+        "ticker_sentiment_reasoning",
+        "tickers",
+        "primary_ticker",
+        "primary_ticker_reasoning",
+        "sectors",
+        "sector_reasoning",
+        "industry",
+        "industry_reasoning",
+        "keywords",
+        "keyword_map",
+        "keyword_reasoning",
+        "entities",
+        "market_session",
+        "market_session_reasoning",
+        "source",
+    }
+
     def __init__(self, db = None):
         if db is None:
             uri = os.getenv("MONGO_URI")
@@ -87,6 +117,58 @@ class ArticleService:
 
         docs = list(cursor)
         return [Article(**doc) for doc in docs]
+
+    def get_article_docs_batch(
+            self,
+            limit: int = 1000,
+            last_id: ObjectId | None = None,
+            filter: Dict | None = None,
+            projection: Dict | None = None,
+            sort_dir: int = ASCENDING,
+    ) -> List[Dict[str, Any]]:
+        query = dict(filter or {})
+
+        if last_id is not None:
+            cursor_filter = {"$gt": last_id} if sort_dir == ASCENDING else {"$lt": last_id}
+            if "_id" in query:
+                query = {"$and": [query, {"_id": cursor_filter}]}
+            else:
+                query["_id"] = cursor_filter
+
+        projection = projection or {}
+        projection["embedding"] = False
+
+        return list(
+            self.collection.find(filter=query, projection=projection)
+            .sort([("_id", sort_dir)])
+            .limit(limit)
+        )
+
+    def update_article_enrichment(self, article_id: ObjectId, enrichment: Dict[str, Any]):
+        update_fields = {}
+        for key, value in enrichment.items():
+            if key not in self.ENRICHMENT_FIELDS and key not in STATUS_FIELDS:
+                continue
+            if key in STATUS_FIELDS or value not in (None, "", [], {}):
+                update_fields[key] = value
+
+        if not update_fields:
+            return {"matched_count": 0, "modified_count": 0, "updated": False}
+
+        result = self.collection.update_one(
+            {"_id": article_id},
+            {
+                "$set": update_fields,
+                "$currentDate": {"enriched_at": True},
+            },
+        )
+
+        return {
+            "matched_count": result.matched_count,
+            "modified_count": result.modified_count,
+            "updated": result.modified_count > 0,
+        }
+
     def get_articles(
             self,
             filter: Dict | None = None,

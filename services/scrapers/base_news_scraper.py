@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import re
+import time
 from typing import List, Optional, Dict, Iterable, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,7 +15,6 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
 from models import Article
-from utils import function_timer2
 
 from utils.logger import logger
 
@@ -59,62 +59,70 @@ class BaseScraper:
     def _log(self, msg: str):
         self.scrape_metadata.setdefault("logs", []).append(msg)
     
-    def scrape(self, urls = None, manual_fetch = False, no_limit = False) -> List[Article]:
-        """
-        Orchestrates: get links -> extract articles (seq or threaded).
-        Subclasses can reuse as-is.
-        """
-        
-        @function_timer2
-        def scrape_with_timer(urls = None, manual_fetch = False, no_limit = False):
-            self.scrape_metadata = {}
-            if urls is None:
-                urls = []
-            logger.info(f"{self.scraper_name or ''}: Fetching article links...")
-            self._log(f"{self.scraper_name or ''}: Fetching article links...")
-            
-            if manual_fetch and urls:
-                links = urls
-            else:
-                links = self.get_article_links()
-                
-            if not links:
-                logger.info("No links found.")
-                self._log("No links found.")
-                return []
-            
-            limit = self.limit
-            if no_limit:
-                limit = len(links)
-                
-            logger.info(f"{self.scraper_name or ''}: Found {len(links)} articles.")
-            self._log(f"{self.scraper_name or ''}: Found {len(links)} articles.")
-            
+    def scrape(self, urls=None, manual_fetch=False, no_limit=False) -> List[Article]:
+        started = time.perf_counter()
+        self.scrape_metadata = {
+            "status": "failed", "fetched_count": 0, "scraped_count": 0,
+            "duplicate_count": 0, "extraction_failed_count": 0,
+        }
+        try:
+            links = urls if manual_fetch and urls else self.get_article_links()
             self.scrape_metadata["fetched_count"] = len(links)
-            
+            if not links:
+                empty_feed = (self.scrape_metadata.get("feed_valid")
+                              and self.scrape_metadata.get("feed_item_count") == 0)
+                self.scrape_metadata["status"] = "no_new" if empty_feed else "failed"
+                if not empty_feed:
+                    self.scrape_metadata["error"] = "No usable article links discovered"
+                return []
+
+            # Check all discovered candidates before applying the per-run extraction limit.
+            candidates, seen = [], set()
+            for link in links:
+                url = self.normalize_url(link)
+                if url in seen:
+                    continue
+                seen.add(url)
+                if (self.verify_db and self.article_db_service
+                        and self.article_db_service.url_exists_in_db(url)):
+                    self.scrape_metadata["duplicate_count"] += 1
+                    continue
+                candidates.append(url)
+            limit = len(candidates) if no_limit else self.limit
+            selected = candidates[:limit]
+            self.scrape_metadata["attempted_count"] = len(selected)
+            if not selected:
+                self.scrape_metadata["status"] = "no_new"
+                return []
+
             if self.async_scrape:
-                logger.info(f"{self.scraper_name or ''}: Starting async extraction of articles...")
-                self._log(f"{self.scraper_name or ''}: Starting async extraction of articles...")
-    
-                articles = self._extract_many_threaded(links, limit=limit)
+                articles = self._extract_many_threaded(selected, limit=limit)
             else:
                 articles = []
-                for i, link in enumerate(links[: limit], start=1):
-                    logger.info(f"{self.scraper_name or ''}: [{i}/{min(len(links), self.limit)}] Scraping: {link}")
-                    self._log(f"{self.scraper_name or ''}: [{i}/{min(len(links), self.limit)}] Scraping: {link}")
-                    
-                    art = self.extract_article(link)
-                    if art and art.content:
-                        articles.append(art)
-    
-            logger.info(f"{self.scraper_name or ''}: Done. Scraped {len(articles)} article(s).")
-            self._log(f"{self.scraper_name or ''}: Done. Scraped {len(articles)} article(s).")
+                for link in selected:
+                    try:
+                        article = self.extract_article(link)
+                        if article and article.content.strip():
+                            articles.append(article)
+                    except Exception as exc:
+                        self._log(f"Extraction failed: {type(exc).__name__}")
             self.scrape_metadata["scraped_count"] = len(articles)
-            
+            failed = len(selected) - len(articles)
+            self.scrape_metadata["extraction_failed_count"] = failed
+            self.scrape_metadata["status"] = (
+                "success" if not failed else "partial" if articles else "failed"
+            )
             return articles
-        articles, time_elapsed = scrape_with_timer(urls = urls, manual_fetch = manual_fetch, no_limit = no_limit)
-        self.scrape_metadata["duration_sec"] = round(time_elapsed, 3)
-        return articles
+        except Exception as exc:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            self.scrape_metadata["error"] = type(exc).__name__ + (
+                f" (HTTP {code})" if code else ""
+            )
+            self._log(self.scrape_metadata["error"])
+            return []
+        finally:
+            self.scrape_metadata["duration_sec"] = round(time.perf_counter() - started, 3)
+            logger.info("%s: %s", self.scraper_name, self.scrape_metadata)
 
     # ---------- Methods for subclasses to implement or override ----------
 
@@ -138,7 +146,7 @@ class BaseScraper:
     def fetch_html(self, url: str) -> Optional[str]:
 
         try:
-            r = session.get(url, headers=self.headers)
+            r = session.get(url, headers=self.headers, timeout=15)
             r.raise_for_status()
             return r.text
         except requests.RequestException as e:
@@ -206,17 +214,6 @@ class BaseScraper:
         out_by_index: List[Optional[Article]] = [None] * len(links)
         
         def extract(url):
-            # check if article exists in db
-            if self.article_db_service and self.verify_db:
-                try:
-                    if self.article_db_service.url_exists_in_db(url):
-                        logger.info(f"Article with url: '{url}' already exists in database. Skipping")
-                        self._log(f"Article {url} already exists in database.")
-                        return None
-                except Exception as e:
-                    logger.warning(f"Error verifying if url is already present: {e}")
-                    self._log(f"Error verifying if url is already present: {e}")
-            
             return self.extract_article(url)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
