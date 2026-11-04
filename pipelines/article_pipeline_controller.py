@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
+import re
 from datetime import datetime, timezone
 from bson import ObjectId
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 
 from models import Article
+from services.article_enrichment import ArticleEnricher, backfill_missing_summaries
 from services.scrapers import (
     BaseScraper,
     MarketWatchScraper,
@@ -31,16 +33,16 @@ logger.setLevel("DEBUG")
 class ArticlePipelineController:
     def __init__(self, article_limit=2, asynchronous=True, llm_summary=True, verify_db=True):
         self.asynchronous = asynchronous
-        self.gemini_client = gemini_client
+        self.gemini_client = gemini_client if llm_summary else None
         self.article_db_service = article_service
         self.pipeline_db_service = pipeline_execution_service
         self.catalyst_cluster_service = catalyst_cluster_service
-        llm = self.gemini_client if llm_summary else None
 
         self.configs = {
             "limit": article_limit,
             "async_scrape": asynchronous,
-            "gemini_client": llm,
+            # All AI calls run in enrich_articles so attempts and retries are tracked once.
+            "gemini_client": None,
             "article_db_service": self.article_db_service,
             "verify_db": verify_db,
         }
@@ -76,6 +78,7 @@ class ArticlePipelineController:
                         if result:
                             articles.extend(result)
                     except Exception as e:
+                        s.scrape_metadata.update(status="failed", error=type(e).__name__)
                         logger.exception("Scraper %s failed async: %s", type(s).__name__, e)
         # final_list = [article for article in articles if article.tickers is not None and len(article.tickers)>0]
         sorted_articles = sorted(articles, key=lambda article: article.publish_date or "", reverse=True)
@@ -88,18 +91,57 @@ class ArticlePipelineController:
         """
         Returns an updated Article model, or None if summarization fails.
         """
-        try:
-            llm_fields = self.gemini_client.summarize_article(article)
-            if not llm_fields:
-                return None
+        updated = ArticleEnricher(self.gemini_client).enrich(article)
+        return updated if updated.enrichment_status == "complete" else None
 
-            # Merge LLM fields into the existing article (keeps url/title/content/etc.)
-            updated = article.model_copy(update=llm_fields)
-            return updated
+    @staticmethod
+    def _needs_enrichment(article: Article) -> bool:
+        return ArticleEnricher.needs_enrichment(article)
 
-        except Exception as e:
-            logger.warning(f"Worker failed for {getattr(article, 'url', 'unknown url')}: {e}")
+    @staticmethod
+    def _fallback_ticker_fields(article: Article) -> Optional[Dict]:
+        text = " ".join(
+            part for part in [article.title or "", article.content or "", article.summary or ""] if part
+        )
+        if not text:
             return None
+
+        patterns = [
+            r"\b(?:NASDAQ|NYSE|AMEX|NYSEARCA|OTC|TSX|TSXV)\s*:\s*([A-Z][A-Z0-9.\-]{0,7})\b",
+            r"\$([A-Z][A-Z0-9.\-]{0,7})\b",
+        ]
+        seen = set()
+        tickers = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                ticker = match.group(1).upper().strip(".-")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    tickers.append(ticker)
+
+        if not tickers:
+            return None
+
+        return {
+            "tickers": tickers,
+            "primary_ticker": tickers[0],
+        }
+
+    def enrich_articles(self, articles: List[Article]) -> List[Article]:
+        enricher = ArticleEnricher(self.gemini_client)
+        enriched_articles = []
+        for article in articles:
+            updated = enricher.enrich(article)
+            if updated.enrichment_status == "failed" and not updated.tickers:
+                updated = updated.model_copy(update=self._fallback_ticker_fields(updated) or {})
+            enriched_articles.append(updated)
+        logger.info(
+            "Article enrichment step completed. complete=%s failed=%s total=%s",
+            sum(a.enrichment_status == "complete" for a in enriched_articles),
+            sum(a.enrichment_status == "failed" for a in enriched_articles),
+            len(enriched_articles),
+        )
+        return enriched_articles
 
     def backfill_articles(
         self,
@@ -177,6 +219,91 @@ class ArticlePipelineController:
             "updated": updated_total,
             "failed": failed_total,
         }
+
+    def backfill_missing_enrichment_since(
+        self,
+        since: datetime,
+        batch_size: int = 25,
+        limit_total: Optional[int] = None,
+        dry_run: bool = False,
+        use_llm: bool = True,
+    ):
+        if use_llm:
+            return backfill_missing_summaries(
+                self.article_db_service.collection, ArticleEnricher(self.gemini_client),
+                since=since, batch_size=batch_size, limit_total=limit_total, dry_run=dry_run,
+            )
+
+        missing_conditions = [
+            {"tickers": {"$exists": False}},
+            {"tickers": None},
+            {"tickers": []},
+        ]
+        filter = {
+            "created_at": {"$gte": since},
+            "$or": missing_conditions,
+        }
+
+        processed_total = 0
+        updated_total = 0
+        failed_total = 0
+        skipped_total = 0
+        last_id = None
+
+        while True:
+            if limit_total is not None and processed_total >= limit_total:
+                break
+
+            current_limit = batch_size
+            if limit_total is not None:
+                current_limit = min(batch_size, limit_total - processed_total)
+
+            docs = self.article_db_service.get_article_docs_batch(
+                filter=filter,
+                limit=current_limit,
+                last_id=last_id,
+            )
+            if not docs:
+                break
+
+            last_id = docs[-1]["_id"]
+
+            for doc in docs:
+                article_id = doc["_id"]
+                article = Article(**doc)
+                processed_total += 1
+
+                if dry_run:
+                    updated_total += 1
+                    continue
+                fields = self._fallback_ticker_fields(article)
+                if not fields:
+                    failed_total += 1
+                    continue
+
+                result = self.article_db_service.update_article_enrichment(article_id, fields)
+                if result.get("updated"):
+                    updated_total += 1
+                else:
+                    skipped_total += 1
+
+            logger.info(
+                "Backfill batch completed. processed=%s updated=%s failed=%s skipped=%s",
+                processed_total,
+                updated_total,
+                failed_total,
+                skipped_total,
+            )
+
+        return {
+            "processed": processed_total,
+            "updated": updated_total,
+            "failed": failed_total,
+            "skipped": skipped_total,
+            "dry_run": dry_run,
+            "use_llm": use_llm,
+            "since": since.isoformat(),
+        }
     
     def run_articles_v2(self):
         articles = self.article_db_service.get_articles(limit=3)
@@ -206,6 +333,7 @@ class ArticlePipelineController:
         
         articles_fetched : list[Article] = self.fetch_latest_news_articles()
         logger.info(f"Total articles fetched: {len(articles_fetched)}")
+        articles_fetched = self.enrich_articles(articles_fetched)
         insert_result = {}
         clustering_result = {}
         
@@ -226,6 +354,18 @@ class ArticlePipelineController:
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
+
+        failed_sources = sum(s.scrape_metadata.get("status") == "failed"
+                             for s in self.active_scrapers)
+        degraded_sources = sum(s.scrape_metadata.get("status") in ("failed", "partial")
+                               for s in self.active_scrapers)
+        enrichment_failed = sum(a.enrichment_status == "failed" for a in articles_fetched)
+        if failed_sources == len(self.active_scrapers):
+            run_status = "failed"
+        elif degraded_sources or enrichment_failed or clustering_result.get("status") == "error":
+            run_status = "partial"
+        else:
+            run_status = "success" if insert_result.get("inserted_count", 0) else "no_new"
         
         run_metadata = {
             "_id": pipeline_run_id,
@@ -234,7 +374,8 @@ class ArticlePipelineController:
             "end_time": datetime.now(timezone.utc),
             "limit": attempted,
             "duration": elapsed_time,
-            "status": "success",
+            "status": run_status,
+            "failed_sources": failed_sources,
             "config": {"limit": self.configs["limit"], "async_scrape": self.configs["async_scrape"],
                        "verify_db": self.configs["verify_db"]},
             "sources": [
@@ -245,6 +386,10 @@ class ArticlePipelineController:
                 } for s in self.active_scrapers],
             "articles_fetched": len(articles_fetched),
             "articles_inserted": insert_result.get("inserted_count", 0),
+            "enrichment": {
+                "complete": sum(a.enrichment_status == "complete" for a in articles_fetched),
+                "failed": sum(a.enrichment_status == "failed" for a in articles_fetched),
+            },
             "articles_clustered": clustering_result.get("clustered", 0),
             "clustering": clustering_result,
 
@@ -255,14 +400,17 @@ class ArticlePipelineController:
             f"Article pipeline run completed with pipeline_run_id: {pipeline_run_id} in {elapsed_time:.2f} seconds."
         )
 
-        now = datetime.now(timezone.utc)
+        return run_metadata
         
 
 def main():
     pipeline = ArticlePipelineController(article_limit=20, verify_db=True)
 
     # pipeline.run()
-    pipeline.backfill_articles(limit_total=2)
+    result = pipeline.backfill_missing_enrichment_since(
+        since=datetime(2026, 4, 25, tzinfo=timezone.utc),
+    )
+    print(result)
 
 if __name__ == "__main__":
     main()

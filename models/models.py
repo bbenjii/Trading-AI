@@ -1,4 +1,5 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -7,6 +8,7 @@ class Article(BaseModel):
     url: str
     title: str
     content: str
+    source_content_type: Literal["full", "excerpt"] = "full"
     publish_date: Optional[str] = None
     authors: Optional[List[str]] = None
 
@@ -15,6 +17,13 @@ class Article(BaseModel):
     summary_short: Optional[str] = None
     summary_bullets: Optional[List[str]] = None
     summary_extended: Optional[str] = None
+
+    enrichment_status: Literal["pending", "complete", "failed"] = "pending"
+    enrichment_attempts: int = Field(default=0, ge=0)
+    enrichment_last_error: Optional[str] = None
+    enrichment_attempted_at: Optional[datetime] = None
+    enrichment_model: Optional[str] = None
+    enrichment_retryable: bool = True
 
     event_type: Optional[str] = None
     event_type_reasoning: Optional[str] = None

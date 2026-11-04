@@ -2,7 +2,6 @@ from google import genai
 from google.genai import types
 from google.genai.types import GenerateContentConfig, CreateBatchJobConfig, GoogleSearch
 # from .system_instructions import *
-from services.scrapers import BaseScraper, YahooScraper
 from utils import logger
 import os
 import json
@@ -44,9 +43,14 @@ class GeminiService:
         """
         Initializes the Gemini API client using the provided API key.
         """
-        self.client = genai.Client(api_key=api_key)
-        if not self.client_is_initialized():
-            self.client = None
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=30000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+        self.summary_model = "gemini-3.5-flash-lite"
 
     def client_is_initialized(self):
         """
@@ -55,7 +59,7 @@ class GeminiService:
         """
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
+                model=self.summary_model,
                 contents="Hello"
             )
             if response.text:
@@ -74,7 +78,8 @@ class GeminiService:
 
         return result.embeddings
     
-    def send_request(self, prompt_data, sys_instruct: str = "", schema=None):
+    def send_request(self, prompt_data, sys_instruct: str = "", schema=None,
+                     raise_errors: bool = False):
         """
         Sends a prompt with optional system instructions and schema to the Gemini API.
         Returns the parsed response if a schema is provided, otherwise returns the raw response text.
@@ -82,7 +87,7 @@ class GeminiService:
         try:
             payload = json.dumps(prompt_data, ensure_ascii=False, indent=2)
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
+                model=self.summary_model,
                 contents=[payload],
                 config=GenerateContentConfig(
                     system_instruction=sys_instruct,
@@ -93,6 +98,8 @@ class GeminiService:
             res = response.parsed if schema else response.text
             return res
         except Exception as e:
+            if raise_errors:
+                raise
             logger.error(f"Error in sending request to Gemini API: {e}")
             return None
 
@@ -139,7 +146,7 @@ class GeminiService:
 
         return data
     
-    def summarize_article(self, article: Article) -> Optional[Dict]:
+    def summarize_article(self, article: Article, *, raise_errors: bool = False) -> Optional[Dict]:
         """
         Sends a summarization/classification request for a single Article and returns a dict
         matching the LlmSummary schema.
@@ -156,6 +163,7 @@ class GeminiService:
         article_payload = {
             "title": article_dict.get("title", ""),
             "content": content,
+            "source_content_type": article.source_content_type,
             "publish_date": str(article_dict.get("publish_date") or ""),
             "url": article_dict.get("url", ""),
             "authors": article_dict.get("authors") or [],
@@ -181,6 +189,9 @@ class GeminiService:
                 "summary_short: 1 concise sentence in English capturing the main event.",
                 "summary_bullets: 2 to 4 bullet points, each a single factual statement (no speculation).",
                 "summary_extended: 3 to 6 sentences, neutral and factual.",
+                "When source_content_type is excerpt, use only facts in the supplied excerpt; "
+                "do not infer missing details or imply access to the full article. "
+                "Use fewer sentences if needed rather than padding the summary.",
 
                 "tickers: all clearly mentioned stock tickers as uppercase strings. If none, [].",
                 "primary_ticker: the main ticker the article is primarily about; null if none.",
@@ -224,9 +235,12 @@ class GeminiService:
             response: LlmSummary = self.send_request(
                 prompt_data=payload,
                 sys_instruct=sys_instruct,
-                schema=LlmSummary
+                schema=LlmSummary,
+                raise_errors=raise_errors,
             )
         except Exception as e:
+            if raise_errors:
+                raise
             logger.error(f"Error in summarizing article: {e}")
             return None
 
