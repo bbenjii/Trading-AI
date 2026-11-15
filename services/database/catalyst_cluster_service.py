@@ -16,6 +16,12 @@ from services.llm import gemini_client as default_gemini_client
 load_dotenv()
 
 
+TICKERLESS_EVENT_TYPES = {
+    "regulation", "geopolitical", "macro_data", "earnings", "guidance", "merger_acquisition",
+    "partnership", "product_launch", "investigation", "lawsuit", "bankruptcy", "dividend", "stock_split", "ipo",
+}
+
+
 class CatalystClusterService:
     def __init__(self, db=None, gemini_client=None):
         if db is None:
@@ -113,12 +119,28 @@ class CatalystClusterService:
         return self.cluster_articles_by_urls(urls)
 
     def _cluster_single_article(self, article: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        tickerless = not article.get("tickers") and not article.get("primary_ticker")
+        if tickerless:
+            # Repair membership if a prior process stopped between the two writes.
+            existing = self.collection.find_one({"article_ids": str(article["_id"])},
+                                                {"cluster_id": 1, "cluster_version": 1})
+            if existing:
+                self._update_article_cluster_fields(article["_id"], existing["cluster_id"], existing["cluster_version"])
+                return {"action": "attached", "reason": None}
         clusterability = self._clusterability_reason(article)
         if clusterability is not None:
             self._mark_article_unclustered(article["_id"])
             return {"action": "skipped", "reason": clusterability}
 
+        # A tickerless story needs evidence of the same decision or release. A
+        # shared event class and a near publication time alone are too weak.
         candidates = self._find_candidate_clusters(article)
+        if tickerless:
+            terms = self._headline_terms(article.get("title"))
+            candidates = [c for c in candidates if any(
+                len(terms & self._headline_terms(title)) >= 3
+                for title in [c.get("representative_title"), *(c.get("titles") or [])]
+            )]
         scored_candidates = []
         best_cluster = None
         best_score = 0.0
@@ -164,6 +186,14 @@ class CatalystClusterService:
             conditions.append({"event_type": event_type})
 
         query: Dict[str, Any] = {"last_updated_at": {"$gte": cutoff}}
+        if not article_tickers and not primary_ticker:
+            published = self._parse_datetime(article.get("publish_date"))
+            if not published:
+                return []
+            return list(self.collection.find({
+                "last_seen_at": {"$gte": published - timedelta(days=3), "$lte": published + timedelta(days=3)},
+                "event_type": event_type,
+            }).sort("last_seen_at", DESCENDING))
         if conditions:
             query["$or"] = conditions
         candidates = list(self.collection.find(query).sort([("last_updated_at", DESCENDING)]).limit(40))
@@ -219,12 +249,17 @@ class CatalystClusterService:
 
         article_title_terms = self._headline_terms(article.get("title"))
         cluster_title_terms = self._headline_terms(cluster.get("representative_title")) | self._headline_terms(cluster.get("canonical_title"))
+        if not article_tickers and not primary_ticker:
+            titles = [t for t in cluster.get("titles", []) if t]
+            if any(article["title"].strip().casefold() == t.strip().casefold() for t in titles):
+                return 1.0
         if article_title_terms and cluster_title_terms:
             overlap = len(article_title_terms & cluster_title_terms) / max(len(article_title_terms | cluster_title_terms), 1)
             score += 0.25 * overlap
 
         article_publish = self._parse_datetime(article.get("publish_date")) or self._coerce_datetime(article.get("created_at"))
-        cluster_last = self._coerce_datetime(cluster.get("last_updated_at")) or self._coerce_datetime(cluster.get("last_seen_at"))
+        timestamp_field = "last_seen_at" if not article_tickers and not primary_ticker else "last_updated_at"
+        cluster_last = self._coerce_datetime(cluster.get(timestamp_field)) or self._coerce_datetime(cluster.get("last_seen_at"))
         if isinstance(article_publish, datetime) and isinstance(cluster_last, datetime):
             hours = abs((cluster_last - article_publish).total_seconds()) / 3600
             if hours <= 12:
@@ -240,9 +275,9 @@ class CatalystClusterService:
         article_url = article["url"]
         first_seen = self._parse_datetime(article.get("publish_date")) or self._coerce_datetime(article.get("created_at")) or now
 
-        cluster_id = f"cat_{ObjectId()}"
         source = self._article_source(article)
         tickers = self._clean_upper_list(article.get("tickers"))
+        cluster_id = f"cat_{article_id}" if not tickers and not article.get("primary_ticker") else f"cat_{ObjectId()}"
         importance_score = self._safe_float(article.get("importance_score"))
         sentiment_score = self._safe_float(article.get("sentiment_score"))
         representative_title = (article.get("summary_short") or article.get("title") or "").strip()
@@ -280,7 +315,10 @@ class CatalystClusterService:
         }
         cluster_doc.update(self._label_cluster_with_gemini(cluster_doc, [article]))
 
-        self.collection.insert_one(cluster_doc)
+        if not tickers and not article.get("primary_ticker"):
+            self.collection.update_one({"cluster_id": cluster_id}, {"$setOnInsert": cluster_doc}, upsert=True)
+        else:
+            self.collection.insert_one(cluster_doc)
         self._update_article_cluster_fields(article["_id"], cluster_id, 1)
         return cluster_doc
 
@@ -292,18 +330,24 @@ class CatalystClusterService:
 
         rebuilt = self._rebuild_cluster_document(cluster, cluster_articles, match_score=match_score)
 
-        self.collection.update_one(
-            {"_id": cluster["_id"]},
+        updated = self.collection.update_one(
+            {"_id": cluster["_id"], "cluster_version": cluster.get("cluster_version")},
             {"$set": rebuilt},
         )
+        if not updated.matched_count:
+            latest = self.collection.find_one({"_id": cluster["_id"]})
+            if latest is None:
+                raise RuntimeError("Catalyst cluster disappeared during update")
+            self._attach_article_to_cluster(article, latest, match_score)
+            return
         self.article_collection.update_many(
             {"_id": {"$in": [a["_id"] for a in cluster_articles]}},
             {
                 "$set": {
                     "cluster_id": cluster["cluster_id"],
-                    "cluster_version": rebuilt["cluster_version"],
                     "clustered_at": datetime.now(timezone.utc),
-                }
+                },
+                "$max": {"cluster_version": rebuilt["cluster_version"]},
             },
         )
 
@@ -402,7 +446,9 @@ class CatalystClusterService:
         terms = self._article_theme_terms(article)
 
         if not tickers and not primary_ticker:
-            return "missing_tickers"
+            concrete_event = event_type in TICKERLESS_EVENT_TYPES
+            if not (concrete_event and importance >= 0.4 and article.get("summary_short") and terms):
+                return "missing_tickers"
         if not title:
             return "missing_title"
         if importance < 0.15 and not terms:

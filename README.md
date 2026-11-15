@@ -105,3 +105,5 @@ Chaque exécution du pipeline génère aussi des **logs** enregistrés dans la b
 * **Collection `pipeline_log`** : conserve les données d’exécution (heure, nombre d’URLs récupérées, d’articles extraits et d’articles retenus).
 
 Enfin, le pipeline sera **déployé sur le cloud (ex. : GCP – Cloud Run)** et exécuté automatiquement via un **cron job** à intervalle régulier.
+
+Catalyst clustering also admits tickerless corporate, regulatory, geopolitical and macroeconomic events with a summary and an importance score of at least 0.4. Preview the past 30 days with `python -m scripts.backfill_tickerless_events`. Add `--apply` to process eligible articles that still lack a cluster.
